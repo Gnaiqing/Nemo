@@ -198,11 +198,11 @@ def eval_disc_model(t, disc_model, test_dataset, history):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Interactive Data Programming')
     # paths
-    parser.add_argument('--root_dir', type=str, default='../')
+    parser.add_argument('--root_dir', type=str, default='./')
     parser.add_argument('--save_dir', type=str, default='vldb_results')
     parser.add_argument('--data_dir', type=str, default="data")
     # dataset settings
-    parser.add_argument('--dataset', type=str, default='AmazonReview')
+    parser.add_argument('--dataset', type=str, default='youtube')
     parser.add_argument('--test-ratio', type=float, default=0.1)
     parser.add_argument('--valid-ratio', type=float, default=0.1)
     parser.add_argument('--warmup-ratio', type=float, default=0)
@@ -233,6 +233,7 @@ if __name__ == '__main__':
     # experiment settings
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--runs', type=int, nargs='+', default=range(1))
+    parser.add_argument('--qei', action='store_true')
     # run supervised methods
     parser.add_argument('--run-fs', action='store_true')
     parser.add_argument('--run-vs', action='store_true')
@@ -370,6 +371,12 @@ if __name__ == '__main__':
                     keywords_rm = train_dataset.xs_token[cur_query_idxs[0]]
                     lf_model.update_none(keywords_rm)
 
+        average_acc = np.mean(history["test_acc"])
+        average_auc = np.mean(history["test_auc"])
+        average_f1 = np.mean(history["test_f1"])
+        print(f'acc_test_avg: {average_acc}')
+        print(f'auc_test_avg: {average_auc}')
+        print(f'f1_test_avg: {average_f1}')
 
         save_path = f'./feature_{args.feature}_warmup_{args.warmup_ratio}_val_{args.valid_ratio}_lf_{args.lf_acc}_simulate_{args.lf_simulate}'\
                     f'/{args.dataset}/{args.model_type}/{args.lf_method}'\

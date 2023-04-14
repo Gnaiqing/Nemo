@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from copy import deepcopy
 
 from snorkel.labeling.model import LabelModel as SnorkelLM
-from generative_models.labelmodels import NaiveBayes
+# from generative_models.labelmodels import NaiveBayes
 
 import pdb
 import optuna

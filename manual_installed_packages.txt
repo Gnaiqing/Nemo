@@ -1,0 +1,2 @@
+pip3 install torch torchvision torchaudio
+pip3 install numpy scikit-learn pandas tqdm optuna sentence-transformers snorkel lime yake

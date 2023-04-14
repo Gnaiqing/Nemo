@@ -455,12 +455,12 @@ class SentimentLexicon:
         neg_tokens = list()
         with open(pos_words_file, encoding='ISO-8859-1') as f:
             for i, line in enumerate(f):
-                if i >= 30:
+                if i >= 35:
                     token = line.rstrip()
                     pos_tokens.append(token)
         with open(neg_words_file, encoding='ISO-8859-1') as f:
             for i, line in enumerate(f):
-                if i >= 31:
+                if i >= 35:
                     token = line.rstrip()
                     neg_tokens.append(token)
 
