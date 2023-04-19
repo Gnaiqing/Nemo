@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from data_utils import load_data, SentimentLexicon
 from lf_utils import LFAgent
-from query_utils import QueryAgent, LFModel
+from query_utils import QueryAgent, LFModel, LearnedLFModel, BanditQueryAgent, UserModel, LFEmbedder
 from discriminator import get_discriminator
 from label_models import *
 from utils import * 
@@ -212,13 +212,16 @@ if __name__ == '__main__':
     parser.add_argument('--query-size', type=int, default=1)
     parser.add_argument('--train-iter', type=int, default=5)
     # lf simulation settings
+    parser.add_argument('--lf-model', type=str, default='heuristic', choices=['learned', 'heuristic'])
     parser.add_argument('--lf-method', type=str, default='sentiment')
     parser.add_argument('--lf-acc', type=float, default=0.5)
     parser.add_argument('--lf-simulate', type=str, default='lexicon')
+    parser.add_argument('--lf-restrict', type=str, default="lf_model")
     # model settings
     parser.add_argument('--model-type', type=str, default='logistic')
     parser.add_argument('--label-model', type=str, default='mv')
     # query method settings
+    parser.add_argument('--query-agent', type=str, default='greedy', choices=['bandit', 'greedy'])
     parser.add_argument('--query-method', type=str, default='uncertainty_lm')
     parser.add_argument('--seu', action='store_true')
     parser.add_argument('--lexicon', type=int, default=None)
@@ -276,18 +279,31 @@ if __name__ == '__main__':
         rand_state = np.random.RandomState(run)
 
         # init LF model (used only in QEU)
-        if args.qei:
+        if args.lf_model == "heuristic":
             lf_model = LFModel(train_dataset.xs_token, sentiment_lexicon, pn=args.pn, kw=args.kw, dict_size=args.lexicon)
+        elif args.lf_model == "learned":
+            lf_model = LearnedLFModel(train_dataset.xs_token, sentiment_lexicon, pn=args.pn, kw=args.kw, dict_size=args.lexicon)
         else:
             lf_model = None
 
         # init query agent
-        query_agent = QueryAgent(train_dataset.xs_feature, train_dataset.xs_token,
-                                 args.query_method, args.query_size, rand_state, False, args.qei, args.aggregate)
+        if args.query_agent == "greedy":
+            query_agent = QueryAgent(train_dataset.xs_feature, train_dataset.xs_token,
+                                    args.query_method, args.query_size, rand_state, False, args.qei, args.aggregate, lf_model)
+        elif args.query_agent == "bandit":
+            query_agent = BanditQueryAgent(train_dataset.xs_feature, train_dataset.xs_token,
+                                    args.query_method, args.query_size, rand_state, False, args.qei, args.aggregate, lf_model)
+        else:
+            raise ValueError("Query agent not supported.")
 
         # init lf agent
+        if args.lf_restrict == "lf_model":
+            keyword_dict = lf_model.lexicon.keyword_dict
+        else:
+            keyword_dict = None
+
         lf_agent = LFAgent(train_dataset, valid_dataset, sentiment_lexicon, method=args.lf_method, rand_state=rand_state,
-                           lf_acc=args.lf_acc, lf_simulate=args.lf_simulate)
+                           keyword_dict=keyword_dict, lf_acc=args.lf_acc, lf_simulate=args.lf_simulate)
         
 
         # init training data / model / log
@@ -307,9 +323,15 @@ if __name__ == '__main__':
                 if t == 0 and len(warmup_dataset) == 0:
                     pass
                 else:
-                    disc_model = train_disc_model(args, xs_tr, ys_pred_tr_soft, ys_pred_tr_hard, xs_tr_unlabeled, valid_dataset, warmup_dataset)
-                    
-                    eval_disc_model(t, disc_model, test_dataset, history)
+                    if -1 in ys_pred_tr_hard and 1 in ys_pred_tr_hard:
+                        disc_model = train_disc_model(args, xs_tr, ys_pred_tr_soft, ys_pred_tr_hard, xs_tr_unlabeled, valid_dataset, warmup_dataset)
+                        eval_disc_model(t, disc_model, test_dataset, history)
+                        ys_pred = disc_model.predict(train_dataset.xs_feature)
+                        if args.lf_model == "learned":
+                            lf_model.update_user_model(ys_pred=to_onehot(ys_pred))
+                        query_agent.evaluate_lf_model_acc(lf_agent, n_valid=100, ys_pred=to_onehot(ys_pred))
+                    else:
+                        raise ValueError("Only one class exist in current prediction")
 
                     if t == args.num_query:
                         break
@@ -328,9 +350,7 @@ if __name__ == '__main__':
                     # ys_pred = disc_model.predict_proba(train_dataset.xs_feature)
                     ys_pred = disc_model.predict(train_dataset.xs_feature)
 
-                # cur_query_idxs = query_agent.query(L_tr, label_model, lf_model, ys_pred=ys_pred,
-                cur_query_idxs = query_agent.query(L_tr, label_model, lf_model, ys_pred=to_onehot(ys_pred),
-                # cur_query_idxs = query_agent.query(L_tr, label_model, lf_model, ys_pred=to_onehot(train_dataset.ys),
+                cur_query_idxs = query_agent.query(L_tr, label_model, ys_pred=to_onehot(ys_pred),
                                                    use_ys_pred=args.use_ys_pred, disc_model=disc_model)
 
             print('Queried Example: {}'.format(train_dataset.xs_text[cur_query_idxs[0]]))
@@ -340,6 +360,14 @@ if __name__ == '__main__':
             if lf is not None:
                 if args.lf_method == 'sentiment':
                     print('lf: {} --> {}'.format(lf.keyword, lf.label))
+                    if args.lf_model == "learned":
+                        lf_idx = lf_model.get_lf_idx(lf)
+                        print("lf idx: {}".format(lf_idx))
+                        lf_idxs = []
+                        for i in range(len(cur_query_idxs)):
+                            lf_idxs.append(lf_idx)
+                        lf_model.record(cur_query_idxs, lf_idxs)
+
 
                 L_tr, _ = lf_agent.update(lf)
 
@@ -367,9 +395,18 @@ if __name__ == '__main__':
                     lf_model.update(lf.keyword)                
             else:
                 print('No LF returned')
+
                 if args.qei:
                     keywords_rm = train_dataset.xs_token[cur_query_idxs[0]]
                     lf_model.update_none(keywords_rm)
+
+                if args.lf_model == "learned":
+                    # update query agent using lf
+                    lf_idx = lf_model.get_lf_idx(lf=None)
+                    lf_idxs = []
+                    for i in range(len(cur_query_idxs)):
+                        lf_idxs.append(lf_idx)
+                    lf_model.record(cur_query_idxs, lf_idxs)
 
         average_acc = np.mean(history["test_acc"])
         average_auc = np.mean(history["test_auc"])

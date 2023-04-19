@@ -41,7 +41,8 @@ class LabelLF:
 
 
 class LFAgent:
-    def __init__(self, train_dataset, valid_dataset, sentiment_lexicon, method='sentiment', rand_state=None, lf_acc=None, lf_simulate=None):
+    def __init__(self, train_dataset, valid_dataset, sentiment_lexicon, method='sentiment',
+                 keyword_dict=None, rand_state=None, lf_acc=None, lf_simulate=None):
         self.xs_rawtext_tr = train_dataset.xs_text
         self.xs_feature_tr = train_dataset.xs_feature
         self.xs_text_tr = train_dataset.xs_token
@@ -63,6 +64,8 @@ class LFAgent:
 
         self.lf_acc = lf_acc
         self.lf_simulate = lf_simulate
+
+        self.keyword_dict = keyword_dict  # keyword dict used in label model
 
         if lf_simulate == 'expl':
             print('Preparing user model...')
@@ -149,7 +152,10 @@ class LFAgent:
                     if len(tokens) == 0:
                         lf = None
             elif self.lf_simulate == 'acc':
-                tokens = [token for token in x if token not in self.keywords]
+                if self.keyword_dict is not None:
+                    tokens = [token for token in x if token not in self.keywords and token in self.keyword_dict]
+                else:
+                    tokens = [token for token in x if token not in self.keywords]
                 candidate_lfs = list()
                 coverages = list()
                 for token in tokens:
