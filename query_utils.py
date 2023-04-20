@@ -33,6 +33,8 @@ def build_keyword_dict(xs, dict_size):
     corpus = [' '.join(doc) for doc in xs]
     # vectorizer = CountVectorizer(max_df=0.1, min_df=20/len(corpus), stop_words='english', max_features=dict_size)
     vectorizer = CountVectorizer(min_df=20, stop_words='english')
+    # min_df = int(0.01 * len(corpus))
+    # vectorizer = CountVectorizer(min_df=min_df, stop_words='english')
     X = vectorizer.fit_transform(corpus).toarray()
     keyword_dict = vectorizer.vocabulary_
     print(f'Lexicon Size: {len(keyword_dict)}')
@@ -288,11 +290,12 @@ class LFModel:
 
     def evaluate_model_acc(self, query_indices, lf_indices, ys_pred=None):
         pred_lf_probs = self.compute_lf_prob(ys_pred=ys_pred)
+        pred_lf_probs = pred_lf_probs[query_indices, :]
         eps = 1e-6
         pred_lf_probs_eps = (pred_lf_probs + eps) / (1.0 + eps * pred_lf_probs.shape[1]) # used for computing NLL
         labels = np.array(lf_indices)
-        nlls = -np.log(pred_lf_probs[np.arange(len(labels)), labels])
-        pred_lf_probs = pred_lf_probs[query_indices,:]  # get the predicted LF probs on queried indices
+        nlls = -np.log(pred_lf_probs_eps[np.arange(len(labels)), labels])
+          # get the predicted LF probs on queried indices
         pred_lf = np.argmax(pred_lf_probs, axis=1)
         non_abstain = labels != self.null_lf_idx
         accuracy = np.mean(pred_lf == labels)

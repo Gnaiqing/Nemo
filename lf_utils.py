@@ -42,7 +42,7 @@ class LabelLF:
 
 class LFAgent:
     def __init__(self, train_dataset, valid_dataset, sentiment_lexicon, method='sentiment',
-                 keyword_dict=None, rand_state=None, lf_acc=None, lf_simulate=None):
+                 keyword_dict=None, vectorizer=None, rand_state=None, lf_acc=None, lf_simulate=None, n_class=2):
         self.xs_rawtext_tr = train_dataset.xs_text
         self.xs_feature_tr = train_dataset.xs_feature
         self.xs_text_tr = train_dataset.xs_token
@@ -65,7 +65,39 @@ class LFAgent:
         self.lf_acc = lf_acc
         self.lf_simulate = lf_simulate
 
+        self.n_class = n_class
+        self.vectorizer = vectorizer
         self.keyword_dict = keyword_dict  # keyword dict used in label model
+        if self.keyword_dict is not None:
+            assert self.vectorizer is not None
+            n_kw = len(self.keyword_dict)
+            # self.M_tr = np.zeros((len(self.xs_text_tr), n_kw))
+            # self.M_val = np.zeros((len(self.xs_text_val), n_kw))
+            # for kw in self.keyword_dict:
+            #     lf = SentimentLF(keyword=kw.lower(), label=1)
+            #     lf_idx = self.keyword_dict[kw]
+            #     if self.vectorizer is None:
+            #         labels_tr = np.array(list(map(lf.apply, self.xs_text_tr)))
+            #         self.M_tr[:, lf_idx] = labels_tr
+            #         labels_val = np.array(list(map(lf.apply, self.xs_text_val)))
+            #         self.M_val[:, lf_idx] = labels_val
+
+            self.M_tr = (vectorizer.transform(self.xs_text_tr).toarray() != 0).astype(float)
+            self.M_val = (vectorizer.transform(self.xs_text_val).toarray() != 0).astype(float)
+
+            self.lf_accs = np.zeros(n_class*n_kw+1)
+            self.lf_covs = np.zeros_like(self.lf_accs)
+            # TODO: consider multi-class scenario
+            for lf_idx in range(len(self.lf_accs)-1):
+                if lf_idx < n_kw:
+                    # positive LF
+                    labels_tr = self.M_tr[:, lf_idx]
+                else:
+                    # negative LF
+                    labels_tr = -1 * self.M_tr[:, lf_idx - n_kw]
+
+                self.lf_accs[lf_idx] = compute_gt_precision(labels_tr, self.ys_tr)
+                self.lf_covs[lf_idx] = np.mean(labels_tr != 0)
 
         if lf_simulate == 'expl':
             print('Preparing user model...')
@@ -173,6 +205,50 @@ class LFAgent:
                     coverages = np.array(coverages)
                     p = coverages / coverages.sum()
                     lf = candidate_lfs[self.rand_state.choice(range(len(candidate_lfs)), p=p)]
+
+            elif self.lf_simulate == 'acc_modeled':
+                if self.keyword_dict is not None:
+                    tokens = [token for token in x if token not in self.keywords and token in self.keyword_dict]
+                else:
+                    tokens = [token for token in x if token not in self.keywords]
+
+                candidate_lfs = list()
+                coverages = list()
+                for token in tokens:
+                    lf = SentimentLF(keyword=token, label=y, anchor=self.xs_feature_tr[idx], anchor_id=idx)
+                    lf_idx = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
+                    precision = self.lf_accs[lf_idx]
+                    coverage = self.lf_covs[lf_idx]
+                    if precision > self.lf_acc:
+                        candidate_lfs.append(lf)
+                        coverages.append(coverage)
+
+                if len(candidate_lfs) == 0:
+                    lf = None
+                else:
+                    coverages = np.array(coverages)
+                    p = coverages / coverages.sum()
+                    lf = candidate_lfs[self.rand_state.choice(range(len(candidate_lfs)), p=p)]
+
+            elif self.lf_simulate == 'lexicon_modeled':
+                tokens = self.sentiment_lexicon.tokens_with_sentiment(x, y)
+                tokens = [token for token in tokens if
+                          token not in self.keywords and token in self.keyword_dict]  # avoid creating duplicate LFs, a natural assumption simulating real users
+                if len(tokens) == 0:
+                    lf = None
+                else:
+                    while len(tokens) > 0:
+                        token = self.rand_state.choice(tokens, size=1)[0]
+                        lf = SentimentLF(keyword=token, label=y, anchor=self.xs_feature_tr[idx], anchor_id=idx)
+                        lf_idx = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
+                        precision = self.lf_accs[lf_idx]
+                        if precision > self.lf_acc:
+                            break
+                        else:
+                            tokens.remove(token)
+
+                    if len(tokens) == 0:
+                        lf = None
 
             else:
                 raise NotImplementedError()

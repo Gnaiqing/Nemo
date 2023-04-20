@@ -303,7 +303,7 @@ if __name__ == '__main__':
             keyword_dict = None
 
         lf_agent = LFAgent(train_dataset, valid_dataset, sentiment_lexicon, method=args.lf_method, rand_state=rand_state,
-                           keyword_dict=keyword_dict, lf_acc=args.lf_acc, lf_simulate=args.lf_simulate)
+                           keyword_dict=keyword_dict, vectorizer=lf_model.vectorizer_pos, lf_acc=args.lf_acc, lf_simulate=args.lf_simulate)
         
 
         # init training data / model / log
