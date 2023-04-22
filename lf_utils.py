@@ -68,6 +68,7 @@ class LFAgent:
         self.n_class = n_class
         self.vectorizer = vectorizer
         self.keyword_dict = keyword_dict  # keyword dict used in label model
+        self.n_candidate_lfs = 0
         if self.keyword_dict is not None:
             assert self.vectorizer is not None
             n_kw = len(self.keyword_dict)
@@ -223,6 +224,7 @@ class LFAgent:
                         candidate_lfs.append(lf)
                         coverages.append(coverage)
 
+                self.n_candidate_lfs = len(candidate_lfs)
                 if len(candidate_lfs) == 0:
                     lf = None
                 else:
@@ -237,18 +239,24 @@ class LFAgent:
                 if len(tokens) == 0:
                     lf = None
                 else:
-                    while len(tokens) > 0:
-                        token = self.rand_state.choice(tokens, size=1)[0]
+                    candidate_lfs = list()
+                    coverages = list()
+                    for token in tokens:
                         lf = SentimentLF(keyword=token, label=y, anchor=self.xs_feature_tr[idx], anchor_id=idx)
                         lf_idx = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
                         precision = self.lf_accs[lf_idx]
+                        coverage = self.lf_covs[lf_idx]
                         if precision > self.lf_acc:
-                            break
-                        else:
-                            tokens.remove(token)
+                            candidate_lfs.append(lf)
+                            coverages.append(coverage)
 
-                    if len(tokens) == 0:
+                    self.n_candidate_lfs = len(candidate_lfs)
+                    if len(candidate_lfs) == 0:
                         lf = None
+                    else:
+                        coverages = np.array(coverages)
+                        p = coverages / coverages.sum()
+                        lf = candidate_lfs[self.rand_state.choice(range(len(candidate_lfs)))]
 
             else:
                 raise NotImplementedError()

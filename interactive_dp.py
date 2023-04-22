@@ -16,6 +16,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.linear_model import LogisticRegression
 from implyloss import ImplyLoss
 from kliep import DensityRatioEstimator
+
 import pdb
 
 
@@ -273,7 +274,9 @@ if __name__ == '__main__':
     # create sentiment lexicon
     sentiment_lexicon = SentimentLexicon(data_dir)
 
+
     for run in args.runs:
+        n_candidate_lfs = []
         # set random seed
         np.random.seed(run)
         rand_state = np.random.RandomState(run)
@@ -356,6 +359,7 @@ if __name__ == '__main__':
             print('Queried Example: {}'.format(train_dataset.xs_text[cur_query_idxs[0]]))
 
             lf = lf_agent.create_lf(cur_query_idxs)
+            n_candidate_lfs.append(lf_agent.n_candidate_lfs)
 
             if lf is not None:
                 if args.lf_method == 'sentiment':
@@ -414,6 +418,11 @@ if __name__ == '__main__':
         print(f'acc_test_avg: {average_acc}')
         print(f'auc_test_avg: {average_auc}')
         print(f'f1_test_avg: {average_f1}')
+
+        unique, counts = np.unique(n_candidate_lfs, return_counts=True)
+        print("Number of candidate LFs: ")
+        print(unique)
+        print(counts)
 
         save_path = f'./feature_{args.feature}_warmup_{args.warmup_ratio}_val_{args.valid_ratio}_lf_{args.lf_acc}_simulate_{args.lf_simulate}'\
                     f'/{args.dataset}/{args.model_type}/{args.lf_method}'\
