@@ -86,7 +86,7 @@ class LFAgent:
             self.M_tr = (vectorizer.transform(self.xs_text_tr).toarray() != 0).astype(float)
             self.M_val = (vectorizer.transform(self.xs_text_val).toarray() != 0).astype(float)
 
-            self.lf_accs = np.zeros(n_class*n_kw+1)
+            self.lf_accs = np.zeros(n_class*n_kw)
             self.lf_covs = np.zeros_like(self.lf_accs)
             # TODO: consider multi-class scenario
             for lf_idx in range(len(self.lf_accs)-1):
@@ -131,6 +131,26 @@ class LFAgent:
             self.user_model = pipeline
             self.tokenizer = tokenizer
 
+    def check_lf(self, lf_idx):
+        precision = self.lf_accs[lf_idx]
+        if precision >= self.lf_acc:
+            return True
+        else:
+            return False
+
+    def get_lf_idx(self, lf):
+        keyword = lf.keyword
+        label = lf.label
+        if keyword not in self.vectorizer.vocabulary_:
+            raise ValueError(f"Keyword {keyword} not exist in vocabulary")
+        if label == 1:
+            # positive LF
+            idx = self.vectorizer.vocabulary_[keyword]
+        else:
+            # negative LF
+            idx = self.vectorizer.vocabulary_[keyword] + len(self.keyword_dict)
+
+        return idx
 
     def create_lf(self, cur_query_idxs):
         # select one queried point to create LF
@@ -217,7 +237,8 @@ class LFAgent:
                 coverages = list()
                 for token in tokens:
                     lf = SentimentLF(keyword=token, label=y, anchor=self.xs_feature_tr[idx], anchor_id=idx)
-                    lf_idx = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
+                    lf_idx = self.get_lf_idx(lf)
+                    lf_idx2 = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
                     precision = self.lf_accs[lf_idx]
                     coverage = self.lf_covs[lf_idx]
                     if precision > self.lf_acc:
@@ -243,7 +264,8 @@ class LFAgent:
                     coverages = list()
                     for token in tokens:
                         lf = SentimentLF(keyword=token, label=y, anchor=self.xs_feature_tr[idx], anchor_id=idx)
-                        lf_idx = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
+                        lf_idx = self.get_lf_idx(lf)
+                        lf_idx2 = self.keyword_dict[token] + len(self.keyword_dict) * (y == -1)
                         precision = self.lf_accs[lf_idx]
                         coverage = self.lf_covs[lf_idx]
                         if precision > self.lf_acc:

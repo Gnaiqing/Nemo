@@ -7,11 +7,15 @@ from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
 from tqdm import tqdm, trange
 from multiprocessing import Pool
 from lf_utils import SentimentLF, compute_gt_precision
+from label_models import get_label_model
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.model_selection import train_test_split
 from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.feature_selection import VarianceThreshold
+from sklearn.metrics import accuracy_score, precision_score, recall_score
 import yake
 from lf_utils import SentimentLF
+from utils import filter_abtain
 # import spacy
 import pdb
 
@@ -56,8 +60,7 @@ class LFModel:
         self.kw = kw
         self.dict_size = dict_size
         self.X_pos, self.X_neg, self.vectorizer_pos, self.vectorizer_neg = self.build_X(pn, kw, dict_size) # build the example-pos_keyword matrix
-        self.null_lf_idx = self.X_pos.shape[1] + self.X_neg.shape[1]  # LF idx for returning null LF
-    
+
     
     def update(self, keyword):
         # remove keyword from X_pos or X_neg
@@ -116,7 +119,7 @@ class LFModel:
         norm[norm!=0] = 1. / norm[norm!=0]
         X_lambda_neg_prob = (X_lambda_neg_prob.T * norm).T
 
-        lf_probs = np.hstack((X_lambda_pos_prob*0.5, X_lambda_neg_prob*0.5, np.zeros((len(X_lambda_pos_prob),1),dtype=float)))
+        lf_probs = np.hstack((X_lambda_pos_prob*0.5, X_lambda_neg_prob*0.5))
         return lf_probs
 
 
@@ -144,26 +147,8 @@ class LFModel:
         pred_neg = disc_model.predict_proba(neg_lf_centroids)
         neg_lf_scores = -(pred_neg * np.log(np.clip(pred_neg, 1e-8, 1-1e-8))).sum(axis=1)
 
-        lf_scores = np.hstack((pos_lf_scores, neg_lf_scores, np.zeros((len(pos_lf_scores),1),dtype=float)))
+        lf_scores = np.hstack((pos_lf_scores, neg_lf_scores))
         return lf_scores
-
-
-    def get_lf_idx(self, lf=None):
-        if lf is not None:
-            keyword = lf.keyword
-            label = lf.label
-            if label == 1 and keyword in self.vectorizer_pos.vocabulary_:
-                # positive LF
-                idx = self.vectorizer_pos.vocabulary_[keyword]
-            elif label == -1 and keyword in self.vectorizer_neg.vocabulary_:
-                # negative LF
-                idx = self.vectorizer_neg.vocabulary_[keyword] + self.X_pos.shape[1]
-            else:
-                # null LF or LF unmodeled due to low coverage
-                idx = self.null_lf_idx
-        else:
-            idx = self.null_lf_idx
-        return idx
 
     def compute_lf_score_moc(self, label_matrix, label_model, disc_model):
         X_pos = np.copy(self.X_pos)
@@ -205,10 +190,9 @@ class LFModel:
         neg_lf_scores = np.array([cross_entropy(cur_pred, new_pred_neg_lfs[:, j]) for j in range(new_pred_neg_lfs.shape[1])])
         # neg_lf_scores = np.abs(new_pred_neg_lfs.T - cur_pred).sum(axis=1)
 
-        lf_scores = np.hstack((pos_lf_scores, neg_lf_scores, np.zeros((len(pos_lf_scores), 1), dtype=float)))
+        lf_scores = np.hstack((pos_lf_scores, neg_lf_scores))
         return lf_scores
 
-    
 
     def compute_lf_score(self, method, xs_score, ys_pred=None):
         X_pos = np.copy(self.X_pos)
@@ -242,9 +226,8 @@ class LFModel:
         else:
             raise NotImplementedError
 
-        lf_scores = np.hstack((pos_lf_scores, neg_lf_scores, np.zeros(1, dtype=float)))
+        lf_scores = np.hstack((pos_lf_scores, neg_lf_scores))
         return lf_scores
-
 
     def build_X(self, pn=False, kw=False, dict_size=500):
         """ Build the example-keyword matrix and keyword dictionary.
@@ -288,31 +271,139 @@ class LFModel:
 
         return X_pos, X_neg, vectorizer_pos, vectorizer_neg
 
-    def evaluate_model_acc(self, query_indices, lf_indices, ys_pred=None):
-        pred_lf_probs = self.compute_lf_prob(ys_pred=ys_pred)
-        pred_lf_probs = pred_lf_probs[query_indices, :]
-        eps = 1e-6
-        pred_lf_probs_eps = (pred_lf_probs + eps) / (1.0 + eps * pred_lf_probs.shape[1]) # used for computing NLL
-        labels = np.array(lf_indices)
-        nlls = -np.log(pred_lf_probs_eps[np.arange(len(labels)), labels])
-          # get the predicted LF probs on queried indices
-        pred_lf = np.argmax(pred_lf_probs, axis=1)
-        non_abstain = labels != self.null_lf_idx
-        accuracy = np.mean(pred_lf == labels)
-        nll = np.mean(nlls)
-        non_abstain_accuracy = np.mean(pred_lf[non_abstain] == labels[non_abstain])
-        non_abstain_nll = np.mean(nlls[non_abstain])
-        abstain_accuracy = np.mean(pred_lf[~non_abstain] == labels[~non_abstain])
-        abstain_nll = np.mean(nlls[~non_abstain])
-        print(f"Evaluation dataset size: {len(lf_indices)}.")
-        print(f"Num of instance that user return LF: {len(labels[non_abstain])}")
-        print(f"Accuracy of User Model: {100. * accuracy:.2f}")
-        print(f"Accuracy of User Model when user return LF: {100. * non_abstain_accuracy:.2f}")
-        print(f"Accuracy of User Model when user do not return LF: {100. * abstain_accuracy:.2f}")
 
-        print(f"NLL of User Model: {nll:.3f}")
-        print(f"NLL of User Model when user return LF: {non_abstain_nll:.3f}")
-        print(f"NLL of User Model when user do not return LF: {abstain_nll:.3f}")
+class LearnedLFModel(LFModel):
+    def __init__(self, xs, sentiment_lexicon, pn, kw, dict_size, embedding_method, rand_state, lf_score):
+        super(LearnedLFModel, self).__init__(xs, sentiment_lexicon, pn, kw, dict_size)
+        self.user_model = UserModel(embedding_method, self.X_pos != 0, self.lexicon.keyword_dict, rand_state)
+        self.lambda_matrix = self.X_pos != 0
+        self.n_class = 2
+        self.keyword_space_size = len(self.lexicon.keyword_dict)
+        self.lf_space_size = len(self.lexicon.keyword_dict) * self.n_class
+        self.id_to_kw = {}
+        self.lf_score = lf_score
+        for key in self.lexicon.keyword_dict:
+            self.id_to_kw[self.lexicon.keyword_dict[key]] = key
+
+    def get_lf_idx(self, lf=None, k=None, c=None):
+        if lf is not None:
+            keyword = lf.keyword
+            label = lf.label
+
+            if keyword not in self.vectorizer_pos.vocabulary_:
+                raise ValueError(f"Keyword {keyword} not exist in vocabulary")
+            if label == 1:
+                # positive LF
+                idx = self.vectorizer_pos.vocabulary_[keyword]
+            else:
+                # negative LF
+                idx = self.vectorizer_neg.vocabulary_[keyword] + self.X_pos.shape[1]
+        else:
+            assert k is not None and c is not None
+            idx = k + self.keyword_space_size * (c == -1)
+
+        return idx
+    def get_lf_from_idx(self, idx):
+        keyword = self.id_to_kw[idx % self.keyword_space_size]
+        if idx >= self.keyword_space_size:
+            c = -1
+        else:
+            c = 1
+
+        lf = SentimentLF(keyword=keyword, label=c)
+        return lf
+
+    def compute_lf_prob(self, ys_pred=None):
+        """
+        Compute the likelihood that user would consider LF as helpful for all possible LFs.
+        """
+        lf_probs = []
+        for idx in range(self.lf_space_size):
+            lf = self.get_lf_from_idx(idx)
+            p = self.user_model.predict_proba(lf=lf, ys_pred=ys_pred)
+            lf_probs.append(p)
+
+        lambda_matrix = self.X_pos != 0
+        lf_probs_mat = np.tile(lambda_matrix, self.n_class)
+        lf_probs_mat = lf_probs_mat * np.array(lf_probs)
+
+        return lf_probs_mat
+
+    def compute_lf_score_valid(self, lf_agent):
+        """
+        Compute the score of LF based on metric on validation set. Assume majority voting is used as label model
+        for runtime reason.
+        """
+        lf_scores = []
+        used_lfs = []
+        for lf in lf_agent.lfs:
+            lf_idx = self.get_lf_idx(lf)
+            used_lfs.append(lf_idx)
+
+        L_val = lf_agent.L_val
+        L_val_pos = np.sum(L_val == 1, axis=1)
+        L_val_neg = np.sum(L_val == -1, axis=1)
+        Wl_val = np.hstack((lf_agent.M_val, lf_agent.M_val * -1))  # the weak labels provided by each LF
+        pos_count = (Wl_val == 1) + L_val_pos.reshape(-1,1)  # count positive weak label after adding each LF
+        neg_count = (Wl_val == -1) + L_val_neg.reshape(-1,1)  # count negative weak label after adding each LF.
+
+        ys_val = lf_agent.ys_val
+        # compute the baseline accuracy and coverage
+        probs = np.zeros((len(L_val), 2), dtype=float)
+        probs[:,0] = L_val_neg >= L_val_pos
+        probs[:,1] = L_val_pos >= L_val_neg
+        filter_mask_val = L_val_pos + L_val_neg > 0
+        probs = probs[filter_mask_val]
+        pred = np.array([np.random.choice(np.where(y == np.max(y))[0]) for y in probs])
+        pred[pred == 0] = -1
+        acc_base = np.mean(pred == ys_val[filter_mask_val])
+        cov_base = np.mean(filter_mask_val)
+
+        for lf_idx in np.arange(self.lf_space_size):
+            if lf_idx in used_lfs:
+                lf_scores.append(0.0)
+            else:
+                probs = np.zeros((len(L_val), 2), dtype=float)
+                probs[:,0] = neg_count[:, lf_idx] >= pos_count[:, lf_idx]
+                probs[:,1] = pos_count[:, lf_idx] >= neg_count[:, lf_idx]
+                filter_mask_val = pos_count[:, lf_idx] + neg_count[:, lf_idx] > 0
+                probs = probs[filter_mask_val]
+                pred = np.array([np.random.choice(np.where(y == np.max(y))[0]) for y in probs])
+                pred[pred==0] = -1
+                acc = np.mean(pred == ys_val[filter_mask_val])
+                cov = np.mean(filter_mask_val)
+                if self.lf_score == "val_label_acc":
+                    lf_scores.append(acc-acc_base)
+                else:
+                    raise ValueError(f"LF score {self.lf_score} not supported.")
+
+        lf_scores = np.array(lf_scores)
+        return lf_scores
+
+    def evaluate_model_acc(self, lf_agent, history, ys_pred=None):
+        y_pred = []
+        y_true = []
+
+        for c in [-1, 1]:
+            for k in range(self.X_pos.shape[1]):
+                lf = SentimentLF(keyword=self.id_to_kw[k], label=c)
+                p = self.user_model.predict_proba(lf=lf, ys_pred=ys_pred)
+                y_pred.append(p > 0.5)
+                lf_idx = self.get_lf_idx(lf)
+                y_true.append(lf_agent.check_lf(lf_idx))
+
+        acc = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred)
+        recall = recall_score(y_true, y_pred)
+        f1 = 2 * precision * recall / (precision + recall)
+        print(f"User model accuracy: {acc:.3f}")
+        print(f"User model precision: {precision:.3f}")
+        print(f"User model recall: {recall:.3f}")
+        print(f"User model f1: {f1:.3f}")
+        history["user_model_accuracy"].append(acc)
+        history["user_model_precision"].append(precision)
+        history["user_model_recall"].append(recall)
+        history["user_model_f1"].append(f1)
 
 
 class ScoringFunction:
@@ -367,6 +458,7 @@ class QueryAgent:
         return cur_query_idxs
 
 
+
     def query(self, label_matrix, label_model=None, ys_pred=None, use_ys_pred=False, disc_model=None):
         candidate_idxs = np.array(sorted(self.candidate_idxs))
         if self.qei:
@@ -397,142 +489,246 @@ class QueryAgent:
 
         return cur_query_idxs
 
-
     def update_query_model(self, cur_query_idxs):
         self.queried_idxs += list(cur_query_idxs)
         if not self.allow_repeat:
             self.candidate_idxs -= set(cur_query_idxs)
 
-    def evaluate_lf_model_acc(self, lf_agent, n_valid, ys_pred=None):
-        # Evaluate the accuracy of user model by randomly sample data point and predict the LF returned
+
+class LearnedQueryAgent(QueryAgent):
+    def query_(self, lf_agent, ys_pred=None):
         candidate_idxs = np.array(sorted(self.candidate_idxs))
-        simulate_query_idxs = self.rand_state.choice(candidate_idxs, size=n_valid, replace=False)
-        lf_indices = []
-        for idx in simulate_query_idxs:
-            lf = lf_agent.create_lf([idx])
-            lf_idx = self.lf_model.get_lf_idx(lf)
-            lf_indices.append(lf_idx)
+        lf_probs = self.lf_model.compute_lf_prob(ys_pred=ys_pred)
+        lf_scores = self.lf_model.compute_lf_score_valid(lf_agent)
+        x_scores = np.max(lf_probs * lf_scores, axis=1)
+        scores = x_scores[candidate_idxs]
+        cur_query_idxs = list(self.rand_state.choice(np.where(scores == np.max(scores))[0], size=self.query_size,
+                                                     replace=False))  # subset idxs
+        cur_query_idxs = candidate_idxs[cur_query_idxs]  # global idxs
+        self.update_query_model(cur_query_idxs)
 
-        self.lf_model.evaluate_model_acc(simulate_query_idxs, lf_indices, ys_pred=ys_pred)
-
+        return cur_query_idxs
 
 class LFEmbedder:
-    def __init__(self):
-        self.embedding_dim = 6
+    def __init__(self, n_class=2):
+        self.n_class = n_class
 
-    def get_single_lf_embedding(self, lambda_pos, lambda_neg, k, c, ys_pred=None):
-        # get the embedding of LF that predict class c based on feature k
-        if c==1:
-            wl = lambda_pos[:,k]
-        elif c==-1:
-            wl = -lambda_neg[:,k]
-        else:
-            # model the case that user do not return a LF (null LF)
-            embedding = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]).astype(float)
-            return embedding
+    def get_embedding_dim(self, embedding_method):
+        embedding_dim = 3 * self.n_class  # record cov, acc, cov*acc for each possible class
+        return embedding_dim
 
+    def get_lf_embedding(self, lambda_matrix, k, c, ys_pred=None):
+        """
+        Get the embedding of LF that predict class c based on feature k.
+        lambda_matrix: activation matrix of size (n_instance, n_feature)
+        k: feature idx
+        c: class idx
+        ys_pred: pseudo labels of training data
+        """
+        wl = lambda_matrix[:,k] * c  # weak labels
+        embedding = []
         if ys_pred is not None:
-            est_acc = np.sum(wl == ys_pred) / np.sum(wl)
+            est_acc = np.sum(wl == ys_pred) / np.sum(wl != 0)
         else:
             est_acc = 0.5  # default accuracy value
         cov = np.sum(wl != 0) / len(wl)
-        score = cov * (2* est_acc - 1)  # LF score heuristic by IWS
-        pos = float(c == 1)
-        neg = float(c == -1)
-        embedding = np.array([est_acc, cov, score, pos, neg, 0.0]).astype(float)
+        if self.n_class == 2:
+            classes = [-1, 1]
+        else:
+            classes = np.arange(self.n_class)
+        for y in classes:
+            if y == c:
+                embedding = embedding + [cov, est_acc, cov*est_acc]
+            else:
+                embedding = embedding + [0.0, 0.0, 0.0]
+
+        embedding = np.array(embedding, dtype=float)
         return embedding
 
-    def get_lf_embedding(self,lambda_pos, lambda_neg, ys_pred=None):
-        # calculate the embedding of all candidate LFs. return a numpy array of (n_LF * n_dim)
-        # first n_pos_dim are embeddings of LF return +1. next n_neg_dim are embeddings of LF return -1. Last dim
-        # is embedding of null LF.
-        pos_dim = np.shape(lambda_pos)[1]
-        neg_dim = np.shape(lambda_neg)[1]
-        if ys_pred is not None:
-            ys_pred = ys_pred[:,1].reshape(-1,1).astype(bool)
-            a = (lambda_pos & ys_pred).sum(axis=0).astype(float)
-            b = lambda_pos.sum(axis=0).astype(float)
-            pos_est_acc = np.divide(a, b, out=np.zeros_like(a), where=b!=0)
-            a = (lambda_neg & ~ys_pred).sum(axis=0).astype(float)
-            b = lambda_neg.sum(axis=0).astype(float)
-            neg_est_acc = np.divide(a, b, out=np.zeros_like(a), where=b!=0)
+    def get_kw_embedding(self, lambda_matrix, k, ys_pred=None):
+        if self.n_class == 2:
+            classes = [-1, 1]
         else:
-            pos_est_acc = np.ones(pos_dim) * 0.5
-            neg_est_acc = np.ones(neg_dim) * 0.5
+            classes = np.arange(self.n_class)
 
-        pos_cov = np.sum(lambda_pos, axis=0) / len(lambda_pos)
-        pos_score = pos_cov * (2*pos_est_acc - 1)
-        pos_embedding = np.vstack((pos_est_acc, pos_cov, pos_score, np.ones(pos_dim), np.zeros(pos_dim), np.zeros(pos_dim))).astype(float)
-        neg_cov = np.sum(lambda_neg, axis=0) / len(lambda_neg)
-        neg_score = neg_cov * (2*neg_est_acc - 1)
-        neg_embedding = np.vstack((neg_est_acc, neg_cov, neg_score, np.zeros(neg_dim), np.ones(neg_dim), np.zeros(neg_dim))).astype(float)
-        null_embedding = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0]).reshape(1,-1)
-        embedding_matrix = np.vstack((pos_embedding.T, neg_embedding.T, null_embedding))
-        return embedding_matrix
+        embedding = []
+        cov = np.sum(lambda_matrix[:,k] != 0) / len(lambda_matrix)
 
-    def get_sentence_embedding(self, embedding_matrix, lambda_pos, lambda_neg):
-        """
-        Get the embedding of each sentence by masking the non-exist features in sentences as 0
-        return: np.array with size (n_sentence, n_LF * n_feature)
-        """
-        embed_dim = embedding_matrix.shape[1]
-        n = lambda_pos.shape[0]
-        lambda_pos = np.repeat(lambda_pos, embed_dim, axis=1)
-        lambda_neg = np.repeat(lambda_neg, embed_dim, axis=1)
-        lambda_mat = np.hstack((lambda_pos, lambda_neg, np.ones((n, embed_dim)))).astype(float)
-        LF_embedding = embedding_matrix.flatten()
-        sentence_embeddings = lambda_mat * LF_embedding
-        return sentence_embeddings
+        for c in classes:
+            if ys_pred is not None:
+                wl = lambda_matrix[:,k] * c
+                est_acc = np.sum(wl == ys_pred) / np.sum(wl)
+            else:
+                est_acc = 0.5
 
-class UserModel(torch.nn.Module):
+            embedding = embedding + [cov, est_acc, cov*est_acc]
+
+        embedding = np.array(embedding, dtype=float)
+        return embedding
+
+
+class LinearModel(torch.nn.Module):
     def __init__(self, embedding_dim, output_dim):
-        super(UserModel, self).__init__()
+        super(LinearModel, self).__init__()
         self.embedding_dim = embedding_dim
         self.output_dim = output_dim
-        self.fc1 = torch.nn.Linear(embedding_dim, 1)
+        self.fc1 = torch.nn.Linear(embedding_dim, output_dim)
 
     def forward(self, x):
-        x = torch.reshape(x, (-1, self.output_dim, self.embedding_dim))  # (n_data * n_LF * n_feat)
-        x = self.fc1(x).squeeze()
+        x = self.fc1(x)
         return x
 
-class UserModelTrainer:
-    def __init__(self, output_dim):
-        self.queried_indices = []
-        self.lf_indices = []
-        self.lf_embedder = LFEmbedder()
+    def predict_proba(self, x):
+        with torch.no_grad():
+            p = F.softmax(self.forward(x), dim=1)
+
+        p = p.cpu().detach().numpy()
+        return p
+
+class MLPModel(torch.nn.Module):
+    def __init__(self, embedding_dim, output_dim, hidden_dim=10):
+        super(MLPModel, self).__init__()
+        self.embedding_dim = embedding_dim
         self.output_dim = output_dim
-        self.model = UserModel(self.lf_embedder.embedding_dim, self.output_dim)
+        self.fc1 = torch.nn.Linear(embedding_dim, hidden_dim)
+        self.fc2 = torch.nn.Linear(hidden_dim, output_dim)
 
-    def add(self, query_idx, lf_idx):
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+    def predict_proba(self, x):
+        with torch.no_grad():
+            p = F.softmax(self.forward(x), dim=1)
+
+        p = p.cpu().detach().numpy()
+        return p
+
+
+class UserModel:
+    def __init__(self, embedding_method, lambda_matrix, keyword_dict, rand_state, max_lf_per_x=1, n_class=2):
+        self.embedding_method = embedding_method
+        self.lambda_matrix = lambda_matrix
+        self.n_class = n_class
+        self.keyword_dict = keyword_dict
+        self.rand_state = rand_state
+        self.max_lf_per_x = max_lf_per_x  # maximum number of LFs returned per instance
+        self.lf_embedder = LFEmbedder(n_class=n_class)
+        embedding_dim = self.lf_embedder.get_embedding_dim(embedding_method)
+        if self.embedding_method == "lf":
+            # the model predicts whether the user would treat specific LF as helpful
+            output_dim = 2
+        elif self.embedding_method == "kw":
+            # the model predicts which class the user would return for specific keyword
+            output_dim = self.n_class + 1
+        else:
+            raise ValueError("Embedding method not supported")
+
+        self.model = LinearModel(embedding_dim, output_dim)
+        self.queried_indices = []
+        self.returned_lfs = []
+
+    def add(self, query_idx, lfs):
         self.queried_indices.append(query_idx)
-        self.lf_indices.append(lf_idx)
+        self.returned_lfs.append(lfs)
 
-    def train_model(self, lambda_pos, lambda_neg, ys_pred=None):
-        lf_embedding = self.lf_embedder.get_lf_embedding(lambda_pos, lambda_neg, ys_pred=ys_pred)
-        sentence_embedding = self.lf_embedder.get_sentence_embedding(lf_embedding, lambda_pos, lambda_neg)
+    def create_training_set(self, ys_pred=None):
+        train_X = []
+        train_y = []
+        lf_map = {}
+        used_kw = np.zeros(len(self.keyword_dict),dtype=bool)
+        for query_idx, lfs in zip(self.queried_indices, self.returned_lfs):
+            # add user provided LFs to training data
+            for lf in lfs:
+                if lf.keyword in self.keyword_dict:
+                    k = self.keyword_dict[lf.keyword]
+                else:
+                    raise ValueError(f"Keyword {lf.keyword} not exist in keyword dict.")
+
+                c = lf.label
+                lf_map[k] = c  # record the existing LFs in the map
+                used_kw[k] = True
+                if self.embedding_method == "lf":
+                    lf_embedding = self.lf_embedder.get_lf_embedding(self.lambda_matrix, k, c, ys_pred=ys_pred)
+                    train_X.append(lf_embedding)
+                    train_y.append(1)  # user regard it as helpful LF
+                elif self.embedding_method == "kw":
+                    kw_embedding = self.lf_embedder.get_kw_embedding(self.lambda_matrix, k, ys_pred=ys_pred)
+                    if self.n_class == 2:
+                        c = (c + 1) // 2  # map -1 to 0
+                    train_X.append(kw_embedding)
+                    train_y.append(c)
+
+            # add negative examples to training data
+            if len(lfs) == self.max_lf_per_x:
+                if self.embedding_method == "lf":
+                    for lf in lfs:
+                        k = self.keyword_dict[lf.keyword]
+                        if self.n_class == 2:
+                            alter_c = - lf.label
+                        else:
+                            classes = [i for i in range(self.n_class) if i != lf.label]
+                            alter_c = self.rand_state.choice(classes)
+                        lf_embedding = self.lf_embedder.get_lf_embedding(self.lambda_matrix, k, alter_c, ys_pred=ys_pred)
+                        train_X.append(lf_embedding)
+                        train_y.append(0)  # user regard it as nonhelpful LF
+            else:
+                if self.embedding_method == "lf":
+                    candidate_k = np.nonzero(self.lambda_matrix[query_idx,:])[0]
+                    if len(candidate_k) == 0:
+                        continue
+                    n_neg = max(len(lfs), 1)
+                    for i in range(n_neg):
+                        k = np.random.choice(candidate_k)
+                        if self.n_class == 2:
+                            classes = [-1, 1]
+                        else:
+                            classes = range(self.n_class)
+                        if k in lf_map:
+                            classes = [i for i in classes if i != lf_map[k]]
+                        alter_c = self.rand_state.choice(classes)
+                        lf_embedding = self.lf_embedder.get_lf_embedding(self.lambda_matrix, k, alter_c,
+                                                                         ys_pred=ys_pred)
+                        train_X.append(lf_embedding)
+                        train_y.append(0)
+
+                elif self.embedding_method == "kw":
+                    candidate_k_list = np.nonzero(self.lambda_matrix[query_idx,:] & ~used_kw)[0]
+                    for k in candidate_k_list:
+                        used_kw[k] = True
+                        kw_embedding = self.lf_embedder.get_kw_embedding(self.lambda_matrix, k, ys_pred=ys_pred)
+                        c = self.n_class
+                        train_X.append(kw_embedding)
+                        train_y.append(c)
+
+        train_X = np.vstack(train_X)
+        train_X = torch.tensor(train_X, dtype=torch.float)
+        train_y = torch.tensor(train_y, dtype=torch.long)
+        return train_X, train_y
+
+    def train_model(self, ys_pred=None, valid_size=0.2):
         # build training dataset
-        X = torch.tensor(sentence_embedding[np.array(self.queried_indices),:], dtype=torch.float)
-        y = torch.tensor(self.lf_indices,dtype=torch.long)
-        label_unique, counts = np.unique(self.lf_indices, return_counts=True)
-        class_weights = {}
-        for i,c in enumerate(label_unique):
-            class_weights[c] = sum(counts) / counts[i]
+        train_X, train_y = self.create_training_set(ys_pred=ys_pred)
+        train_X, valid_X, train_y, valid_y = train_test_split(train_X, train_y, test_size=valid_size)
 
-        example_weights = [class_weights[c] for c in self.lf_indices]
-        sampler = WeightedRandomSampler(example_weights,len(self.lf_indices))
-        trainset = TensorDataset(X, y)
-        train_dataloader = DataLoader(trainset, batch_size=32, sampler=sampler)
+        trainset = TensorDataset(train_X, train_y)
+        validset = TensorDataset(valid_X, valid_y)
+        print("User model training set size:", len(trainset))
+        print("User model validation set size: ", len(validset))
+        train_dataloader = DataLoader(trainset, batch_size=32, shuffle=True)
+        valid_dataloader = DataLoader(validset, batch_size=512, shuffle=False)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
         criterion = torch.nn.CrossEntropyLoss()
 
         # Train the model
-        pbar = trange(1000, desc="Training", unit="epoch")
+        best_val_loss = float('inf')
+        best_model = None
+        pbar = trange(100, desc="Training", unit="epoch")
         for epoch in pbar:
             running_loss = 0.0
             n_correct = 0.0
             for i, data in enumerate(train_dataloader):
-
                 inputs, labels = data
                 optimizer.zero_grad()
                 outputs = self.model(inputs.float())
@@ -543,44 +739,55 @@ class UserModelTrainer:
                 optimizer.step()
                 running_loss += loss.item()
 
-            accuracy = n_correct / len(trainset)
-            pbar.set_postfix(accuracy=f"{100.*accuracy:.2f}", loss=f"{running_loss/len(train_dataloader):.3f}")
+            # Compute validation loss
+            val_loss = 0.0
+            val_correct = 0.0
+            with torch.no_grad():
+                for data in valid_dataloader:
+                    inputs, labels = data
+                    outputs = self.model(inputs.float())
+                    predictions = outputs.argmax(dim=1, keepdim=True).squeeze()
+                    val_correct += (predictions == labels).sum().item()
+                    val_loss += criterion(outputs, labels).item()
 
+            # Update best model if validation loss improved
+            val_loss /= len(valid_dataloader)
+            accuracy = val_correct / len(validset)
+            pbar.set_postfix(train_acc=f"{100. * n_correct / len(trainset):.2f}",
+                             val_acc=f"{100. * accuracy:.2f}", loss=f"{running_loss / len(train_dataloader):.3f}",
+                             val_loss=f"{val_loss:.3f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = self.model.state_dict()
 
-        print("Training set size:", len(y))
+        # Load the best model
+        self.model.load_state_dict(best_model)
 
-
-class LearnedLFModel(LFModel):
-    def __init__(self, xs, sentiment_lexicon, pn, kw, dict_size):
-        super(LearnedLFModel, self).__init__(xs, sentiment_lexicon, pn, kw, dict_size)
-        output_dim = self.X_pos.shape[1] + self.X_neg.shape[1] + 1
-        self.trainer = UserModelTrainer(output_dim)
-        self.lambda_pos_origin = (self.X_pos != 0)  # record the existence of positive feature
-        self.lambda_neg_origin = (self.X_neg != 0)  # record the existence of negative feature
-
-    def compute_lf_prob(self, ys_pred=None):
-        xs_embedding = torch.Tensor(self.get_xs_embedding(ys_pred=ys_pred))  # embed training data
-        lf_prob = self.trainer.model(xs_embedding).detach().cpu().numpy()
-        lf_prob = scipy.special.softmax(lf_prob, axis=1)
-        return lf_prob
-
-    def get_xs_embedding(self, ys_pred=None):
+    def predict_proba(self, lf=None, k=None, c=None, ys_pred=None):
         """
-        Get embedding of training dataset
+        Return the probability that the user would consider lf as helpful
         """
-        lambda_pos = (self.X_pos != 0)
-        lambda_neg = (self.X_neg != 0)
-        lf_embedding = self.trainer.lf_embedder.get_lf_embedding(lambda_pos, lambda_neg, ys_pred=ys_pred)
-        xs_embedding = self.trainer.lf_embedder.get_sentence_embedding(lf_embedding, lambda_pos, lambda_neg)
-        return xs_embedding
+        if k is None or c is None:
+            assert lf is not None
+            k = self.keyword_dict[lf.keyword]
+            c = lf.label
 
-    def update_user_model(self, ys_pred=None):
-        self.trainer.train_model(self.lambda_pos_origin, self.lambda_neg_origin, ys_pred=ys_pred)
+        if self.embedding_method == "lf":
+            x = self.lf_embedder.get_lf_embedding(self.lambda_matrix, k, c, ys_pred=ys_pred).reshape((1,-1))
+            x = torch.tensor(x, dtype=torch.float)
+            p = self.model.predict_proba(x).flatten()[1]
 
-    def record(self, query_idxs, lf_idxs):
-        # record interactions
-        for (query_idx, lf_idx) in zip(query_idxs, lf_idxs):
-            self.trainer.add(query_idx, lf_idx)
+        elif self.embedding_method == "kw":
+            y = (lf.label + 1) // 2
+            x = self.lf_embedder.get_kw_embedding(self.lambda_matrix, k, ys_pred=ys_pred).reshape((1,-1))
+            x = torch.tensor(x, dtype=torch.float)
+            p = self.model.predict_proba(x)[y]
+        else:
+            raise ValueError("Embedding method not supported.")
+
+        return p
+
+
 
 
 class BanditQueryAgent(QueryAgent):

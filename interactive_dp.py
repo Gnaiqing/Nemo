@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from data_utils import load_data, SentimentLexicon
 from lf_utils import LFAgent
-from query_utils import QueryAgent, LFModel, LearnedLFModel, BanditQueryAgent, UserModel, LFEmbedder
+from query_utils import QueryAgent, LFModel, LearnedLFModel, LearnedQueryAgent, UserModel, LFEmbedder
 from discriminator import get_discriminator
 from label_models import *
 from utils import * 
@@ -16,7 +16,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.linear_model import LogisticRegression
 from implyloss import ImplyLoss
 from kliep import DensityRatioEstimator
-
+import wandb
 import pdb
 
 
@@ -214,7 +214,9 @@ if __name__ == '__main__':
     parser.add_argument('--train-iter', type=int, default=5)
     # lf simulation settings
     parser.add_argument('--lf-model', type=str, default='heuristic', choices=['learned', 'heuristic'])
+    parser.add_argument('--embedding-method', type=str, default='lf', choices=['lf', 'kw'])
     parser.add_argument('--lf-method', type=str, default='sentiment')
+    parser.add_argument('--lf-score', type=str, default='val_label_acc')
     parser.add_argument('--lf-acc', type=float, default=0.5)
     parser.add_argument('--lf-simulate', type=str, default='lexicon')
     parser.add_argument('--lf-restrict', type=str, default="lf_model")
@@ -222,7 +224,7 @@ if __name__ == '__main__':
     parser.add_argument('--model-type', type=str, default='logistic')
     parser.add_argument('--label-model', type=str, default='mv')
     # query method settings
-    parser.add_argument('--query-agent', type=str, default='greedy', choices=['bandit', 'greedy'])
+    parser.add_argument('--query-agent', type=str, default='greedy', choices=['greedy', 'learned'])
     parser.add_argument('--query-method', type=str, default='uncertainty_lm')
     parser.add_argument('--seu', action='store_true')
     parser.add_argument('--lexicon', type=int, default=None)
@@ -243,6 +245,8 @@ if __name__ == '__main__':
     parser.add_argument('--run-vs', action='store_true')
 
     args = parser.parse_args()
+
+    group_id = wandb.util.generate_id()
 
     # handle relative paths
     save_dir = f'{args.root_dir}/{args.save_dir}'
@@ -274,8 +278,22 @@ if __name__ == '__main__':
     # create sentiment lexicon
     sentiment_lexicon = SentimentLexicon(data_dir)
 
-
     for run in args.runs:
+        # record results to wandb
+        wandb.init(
+            project="hf-idp",
+            config={
+                "dataset": args.dataset,
+                "lf-model": args.lf_model,
+                "lf-score": args.lf_score,
+                "query-agent": args.query_agent,
+                "user-model-input": args.embedding_method,
+                "lf-simulate": args.lf_simulate,
+                "lf-acc-threshold": args.lf_acc,
+                "group-id": group_id
+            }
+        )
+
         n_candidate_lfs = []
         # set random seed
         np.random.seed(run)
@@ -285,16 +303,17 @@ if __name__ == '__main__':
         if args.lf_model == "heuristic":
             lf_model = LFModel(train_dataset.xs_token, sentiment_lexicon, pn=args.pn, kw=args.kw, dict_size=args.lexicon)
         elif args.lf_model == "learned":
-            lf_model = LearnedLFModel(train_dataset.xs_token, sentiment_lexicon, pn=args.pn, kw=args.kw, dict_size=args.lexicon)
+            lf_model = LearnedLFModel(train_dataset.xs_token, sentiment_lexicon, pn=args.pn, kw=args.kw, dict_size=args.lexicon,
+                                      embedding_method=args.embedding_method, rand_state=rand_state, lf_score=args.lf_score)
         else:
             lf_model = None
 
         # init query agent
-        if args.query_agent == "greedy":
+        if args.query_agent in ["greedy", "random"]:
             query_agent = QueryAgent(train_dataset.xs_feature, train_dataset.xs_token,
                                     args.query_method, args.query_size, rand_state, False, args.qei, args.aggregate, lf_model)
-        elif args.query_agent == "bandit":
-            query_agent = BanditQueryAgent(train_dataset.xs_feature, train_dataset.xs_token,
+        elif args.query_agent == "learned":
+            query_agent = LearnedQueryAgent(train_dataset.xs_feature, train_dataset.xs_token,
                                     args.query_method, args.query_size, rand_state, False, args.qei, args.aggregate, lf_model)
         else:
             raise ValueError("Query agent not supported.")
@@ -331,8 +350,34 @@ if __name__ == '__main__':
                         eval_disc_model(t, disc_model, test_dataset, history)
                         ys_pred = disc_model.predict(train_dataset.xs_feature)
                         if args.lf_model == "learned":
-                            lf_model.update_user_model(ys_pred=to_onehot(ys_pred))
-                        query_agent.evaluate_lf_model_acc(lf_agent, n_valid=100, ys_pred=to_onehot(ys_pred))
+                            lf_model.user_model.train_model(ys_pred=ys_pred)
+                            lf_model.evaluate_model_acc(lf_agent, history, ys_pred=ys_pred)
+                            wandb.log(
+                                {
+                                    "num_query": t,
+                                    "train_precision": history["train_precision"][-1],
+                                    "train_coverage": history["train_coverage"][-1],
+                                    "test_acc": history["test_acc"][-1],
+                                    "test_auc": history["test_auc"][-1],
+                                    "test_f1": history["test_f1"][-1],
+                                    "user_model_acc": history["user_model_accuracy"][-1],
+                                    "user_model_precision": history["user_model_precision"][-1],
+                                    "user_model_recall": history["user_model_recall"][-1],
+                                    "user_model_f1": history["user_model_f1"][-1],
+                                }
+                            )
+                        else:
+                            wandb.log(
+                                {
+                                    "num_query": t,
+                                    "train_precision": history["train_precision"][-1],
+                                    "train_coverage": history["train_coverage"][-1],
+                                    "test_acc": history["test_acc"][-1],
+                                    "test_auc": history["test_auc"][-1],
+                                    "test_f1": history["test_f1"][-1],
+                                }
+                            )
+
                     else:
                         raise ValueError("Only one class exist in current prediction")
 
@@ -340,7 +385,8 @@ if __name__ == '__main__':
                         break
 
             # query for new lf
-            if (t // args.train_iter) == 0 or (args.query_method in ['uncertainty_mix', 'uncertainty_dm'] and disc_model is None):
+            if (t // args.train_iter) == 0 or args.query_agent == "random" or \
+                    (args.query_method in ['uncertainty_mix', 'uncertainty_dm'] and disc_model is None):
                 cur_query_idxs = query_agent.warm_start()
             else:
                 assert label_model is not None
@@ -353,8 +399,11 @@ if __name__ == '__main__':
                     # ys_pred = disc_model.predict_proba(train_dataset.xs_feature)
                     ys_pred = disc_model.predict(train_dataset.xs_feature)
 
-                cur_query_idxs = query_agent.query(L_tr, label_model, ys_pred=to_onehot(ys_pred),
-                                                   use_ys_pred=args.use_ys_pred, disc_model=disc_model)
+                if args.query_agent == "learned":
+                    cur_query_idxs = query_agent.query_(lf_agent, ys_pred=to_onehot(ys_pred))
+                else:
+                    cur_query_idxs = query_agent.query(L_tr, label_model, ys_pred=to_onehot(ys_pred),
+                                                       use_ys_pred=args.use_ys_pred, disc_model=disc_model)
 
             print('Queried Example: {}'.format(train_dataset.xs_text[cur_query_idxs[0]]))
 
@@ -365,12 +414,7 @@ if __name__ == '__main__':
                 if args.lf_method == 'sentiment':
                     print('lf: {} --> {}'.format(lf.keyword, lf.label))
                     if args.lf_model == "learned":
-                        lf_idx = lf_model.get_lf_idx(lf)
-                        print("lf idx: {}".format(lf_idx))
-                        lf_idxs = []
-                        for i in range(len(cur_query_idxs)):
-                            lf_idxs.append(lf_idx)
-                        lf_model.record(cur_query_idxs, lf_idxs)
+                        lf_model.user_model.add(cur_query_idxs[0], [lf])
 
 
                 L_tr, _ = lf_agent.update(lf)
@@ -403,14 +447,8 @@ if __name__ == '__main__':
                 if args.qei:
                     keywords_rm = train_dataset.xs_token[cur_query_idxs[0]]
                     lf_model.update_none(keywords_rm)
-
                 if args.lf_model == "learned":
-                    # update query agent using lf
-                    lf_idx = lf_model.get_lf_idx(lf=None)
-                    lf_idxs = []
-                    for i in range(len(cur_query_idxs)):
-                        lf_idxs.append(lf_idx)
-                    lf_model.record(cur_query_idxs, lf_idxs)
+                    lf_model.user_model.add(cur_query_idxs[0], [])
 
         average_acc = np.mean(history["test_acc"])
         average_auc = np.mean(history["test_auc"])
@@ -419,10 +457,7 @@ if __name__ == '__main__':
         print(f'auc_test_avg: {average_auc}')
         print(f'f1_test_avg: {average_f1}')
 
-        unique, counts = np.unique(n_candidate_lfs, return_counts=True)
-        print("Number of candidate LFs: ")
-        print(unique)
-        print(counts)
+        wandb.finish()
 
         save_path = f'./feature_{args.feature}_warmup_{args.warmup_ratio}_val_{args.valid_ratio}_lf_{args.lf_acc}_simulate_{args.lf_simulate}'\
                     f'/{args.dataset}/{args.model_type}/{args.lf_method}'\
