@@ -17,6 +17,7 @@ from sklearn.linear_model import LogisticRegression
 from implyloss import ImplyLoss
 from kliep import DensityRatioEstimator
 import wandb
+import pandas as pd
 import pdb
 
 
@@ -240,9 +241,13 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--runs', type=int, nargs='+', default=range(1))
     parser.add_argument('--qei', action='store_true')
+    parser.add_argument('--shap-repeat', type=int, default=10)
     # run supervised methods
     parser.add_argument('--run-fs', action='store_true')
     parser.add_argument('--run-vs', action='store_true')
+    # run exploration step
+    parser.add_argument('--run-explore', action='store_true')
+
 
     args = parser.parse_args()
 
@@ -274,6 +279,62 @@ if __name__ == '__main__':
     if args.run_vs:
         run_vs(args, valid_dataset, test_dataset)
         sys.exit(1)
+
+    # run exploration process
+    if args.run_explore:
+        pos_frac = np.mean(train_dataset.ys == 1)
+        neg_frac = np.mean(train_dataset.ys == -1)
+        print(f"Pos frac: {pos_frac}, Neg frac: {neg_frac}")
+        keyword = input("Enter keyword (Enter T to terminate)")
+
+        while keyword != "T":
+            active_instances = {
+                "idx": [],
+                "text": [],
+                "label": []
+            }
+            for i in range(len(train_dataset.xs_token)):
+                if keyword in train_dataset.xs_token[i]:
+                    active_instances["idx"].append(i)
+                    active_instances["text"].append(train_dataset.xs_text[i])
+                    active_instances["label"].append(train_dataset.ys[i])
+                    print("Text:", train_dataset.xs_text[i])
+                    print("Label:", train_dataset.ys[i])
+
+            active_instances = pd.DataFrame(active_instances)
+            pos_frac = np.mean(active_instances["label"] == 1)
+            neg_frac = np.mean(active_instances["label"] == -1)
+            coverage = len(active_instances) / len(train_dataset.xs_token)
+            print(f"Keyword: {keyword}, coverage: {coverage}, Pos frac: {pos_frac}, Neg frac: {neg_frac}")
+            cor_keyword = input("Enter correlation keyword to check (Enter T to terminate)")
+            while cor_keyword != "T":
+                cor_exist_labels = []
+                cor_nonexist_labels = []
+                for i in range(len(active_instances)):
+                    idx = active_instances["idx"][i]
+                    if cor_keyword in train_dataset.xs_token[idx]:
+                        cor_exist_labels.append(active_instances["label"][i])
+                    else:
+                        cor_nonexist_labels.append(active_instances["label"][i])
+                cor_exist_labels = np.array(cor_exist_labels)
+                ce_cov = len(cor_exist_labels) / len(train_dataset.xs_token)
+                ce_pos = np.mean(cor_exist_labels == 1)
+                ce_neg = np.mean(cor_exist_labels == -1)
+                cor_nonexist_labels = np.array(cor_nonexist_labels)
+                cn_cov = len(cor_nonexist_labels) / len(train_dataset.xs_token)
+                cn_pos = np.mean(cor_nonexist_labels == 1)
+                cn_neg = np.mean(cor_nonexist_labels == -1)
+                print(f"When {keyword} co-exist with {cor_keyword}, coverage: {ce_cov}, Pos frac: {ce_pos}, Neg frac: {ce_neg}")
+                print(f"When {cor_keyword} is absent, coverage: {cn_cov}, Pos frac: {cn_pos}, Neg frac: {cn_neg}")
+                cor_keyword = input("Enter correlation keyword to check (Enter T to terminate)")
+
+            keyword = input("Enter keyword (Enter T to terminate)")
+        sys.exit(1)
+
+
+
+
+
         
     # create sentiment lexicon
     sentiment_lexicon = SentimentLexicon(data_dir)
@@ -471,4 +532,61 @@ if __name__ == '__main__':
             os.makedirs(os.path.dirname(save_path))
         with open(save_path, 'w') as f:
             json.dump(history, f)
+
+        # calculate the shapley value of each LF
+        lfs = lf_agent.lfs
+        n_lfs = len(lfs)
+        shap_scores = np.zeros(n_lfs)
+        counts = np.zeros(n_lfs)
+        for i in range(args.shap_repeat):
+            history = defaultdict(list)
+            lf_agent_shap = LFAgent(train_dataset, valid_dataset, sentiment_lexicon, method=args.lf_method, rand_state=rand_state,
+                           keyword_dict=keyword_dict, vectorizer=lf_model.vectorizer_pos, lf_acc=args.lf_acc, lf_simulate=args.lf_simulate)
+            order = np.random.permutation(n_lfs)
+            classes = []
+            for j in range(n_lfs):
+                idx = order[j]  # this idx is the index of lf in lf_list, not the global idx
+                lf = lfs[idx]
+                if lf.label not in classes:
+                    classes.append(lf.label)
+                L_tr, _ = lf_agent_shap.update(lf)
+                if len(classes) == 2:
+                    (label_model, xs_tr, ys_tr, ys_pred_tr_soft,
+                     ys_pred_tr_hard, xs_tr_unlabeled) = train_label_model(args, train_dataset, valid_dataset, lf_agent_shap,
+                                                                           discard)
+                    disc_model = train_disc_model(args, xs_tr, ys_pred_tr_soft, ys_pred_tr_hard, xs_tr_unlabeled,
+                                                  valid_dataset, warmup_dataset)
+                    eval_disc_model(j+1, disc_model, test_dataset, history)
+                    if len(history["test_acc"]) > 1:
+                        shap_scores[idx] += history["test_acc"][-1] - history["test_acc"][-2]
+                        counts[idx] += 1
+
+        shap_scores = np.divide(shap_scores, counts, out=np.zeros_like(shap_scores), where=counts!=0)
+        L_tr = lf_agent.L_tr
+        shap_order = np.argsort(shap_scores)[::-1]
+
+        results = {
+            "lf": [],
+            "shapley": [],
+            "coverage": [],
+            "precision": []
+        }
+
+        for idx in shap_order:
+            lf = lfs[idx]
+            print('lf: {} --> {}'.format(lf.keyword, lf.label))
+            coverage = compute_coverage(L_tr[:, idx])
+            precision = compute_gt_precision(L_tr[:,idx], train_dataset.ys)
+            print('Shapley value: {}; LF coverage: {}; LF precision: {}'.format(shap_scores[idx],coverage, precision))
+            results["lf"].append('{} --> {}'.format(lf.keyword, lf.label))
+            results["shapley"].append(shap_scores[idx])
+            results["coverage"].append(coverage)
+            results["precision"].append(precision)
+
+        results = pd.DataFrame(results)
+        results.to_csv(save_path+"_shap.csv")
+
+
+
+
 
